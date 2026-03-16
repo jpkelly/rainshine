@@ -49,7 +49,6 @@ sudo systemctl enable olad
 sudo systemctl start olad
 ola_patch --device 7 --port 0 --universe 1
 ola_patch --device 7 --port 1 --universe 2
-ola_patch --device 7 --port 2 --universe 3
 ```
 
 Verify: http://PiDMX.local:9090
