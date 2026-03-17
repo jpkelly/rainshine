@@ -37,12 +37,6 @@ from ola.ClientWrapper import ClientWrapper
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import BlockingOSCUDPServer
 
-try:
-    import sdnotify
-    _notifier = sdnotify.SystemdNotifier()
-except ImportError:
-    _notifier = None
-
 
 # ── Grid size ────────────────────────────────────────────────────────────────
 COLS = 10
@@ -265,9 +259,6 @@ def main():
     osc_server = start_osc_server(params, osc_port)
     log.info("OSC listening on port %d", osc_port)
 
-    # Notify systemd we're ready
-    if _notifier:
-        _notifier.notify("READY=1")
     # ── Graceful shutdown ────────────────────────────────────────────────────
     running = True
 
@@ -356,10 +347,6 @@ def main():
         consecutive_errors = 0
         frame_count += 1
 
-        # Ping systemd watchdog
-        if _notifier:
-            _notifier.notify("WATCHDOG=1")
-
         # Periodic status log
         now = time.perf_counter()
         if now - last_status_log >= STATUS_LOG_INTERVAL:
@@ -373,13 +360,19 @@ def main():
             send_errors = 0
             last_status_log = now
 
-        # Periodic OLA health check — reconnect proactively if olad died
+        # Periodic OLA health check — only reconnect if olad was down
         if now - last_ola_health_check >= OLA_HEALTH_INTERVAL:
             last_ola_health_check = now
             try:
-                ensure_olad()
-                wrapper, client = create_ola_client()
-                log.debug("OLA health check OK")
+                result = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", "olad"],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    log.warning("olad is not active, restarting and reconnecting")
+                    ensure_olad()
+                    wrapper, client = create_ola_client()
+                    log.info("OLA reconnected after health check")
             except Exception:
                 log.exception("OLA periodic health check failed")
 
