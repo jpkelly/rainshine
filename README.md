@@ -62,17 +62,25 @@ Via http://10.0.0.123:
 - Color Order: **GRB**
 - DMX Start Address: **1**
 
-### 6. Test
+### 6. Clone the repo
+
+```bash
+cd ~
+git clone https://github.com/<your-user>/rainshine.git
+```
+
+### 7. Test
 
 ```bash
 source ~/rainshine-env/bin/activate
-python3 ~/rainshine_dmx.py --preview
+cd ~/rainshine
+python3 rainshine_dmx.py --preview
 ```
 
-### 7. Autostart on boot
+### 8. Autostart on boot
 
 ```bash
-sudo cp ~/rainshine.service /etc/systemd/system/
+sudo cp ~/rainshine/rainshine.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable rainshine
 sudo systemctl start rainshine
@@ -130,12 +138,50 @@ python3 -c "from pythonosc.udp_client import SimpleUDPClient; SimpleUDPClient('P
 ## Service Management
 
 ```bash
-sudo systemctl status rainshine    # Check status
-sudo systemctl stop rainshine      # Stop
-sudo systemctl restart rainshine   # Restart
-sudo systemctl disable rainshine   # Disable autostart
-journalctl -u rainshine -f         # View live logs
+sudo systemctl status rainshine                  # Check status
+sudo systemctl stop rainshine                    # Stop
+sudo systemctl restart rainshine                 # Restart
+sudo systemctl disable rainshine                 # Disable autostart
+journalctl -u rainshine -f                       # View live logs
+systemctl show rainshine --property=NRestarts    # Restart count since boot
 ```
+
+The service uses `Restart=always` with `RestartSec=5`, so it will automatically recover from crashes.
+
+After editing project files, redeploy with:
+
+```bash
+sudo cp ~/rainshine/rainshine.service /etc/systemd/system/rainshine.service
+sudo systemctl daemon-reload
+sudo systemctl restart rainshine
+```
+
+## Monitoring
+
+The script logs a status line every 5 minutes with frame count, actual FPS, and error counts:
+
+```
+2026-03-17 00:26:17 [INFO] Status: 17999 frames in 300s (60.0 fps), 0 send errors, 0 consecutive errors
+```
+
+To monitor remotely from a Mac:
+
+```bash
+ssh pi@PiDMX.local 'journalctl -u rainshine -f'
+```
+
+Filter for problems:
+
+```bash
+journalctl -u rainshine --since "1 hour ago" --no-pager | grep -E "ERROR|WARNING|Status:|exception"
+```
+
+## Error Handling
+
+- **Render/GPU errors**: caught and retried (exits after 50 consecutive failures for clean systemd restart)
+- **OLA SendDmx errors**: caught, `olad` restarted if down, client reconnected automatically
+- **OLA health check**: every 60 seconds, verifies `olad` is active; only reconnects if it was down
+- **Blackout on exit**: sends all-zero DMX data before shutting down
 
 ## Pixel Mapping
 
@@ -154,3 +200,16 @@ DMX channels are split across sACN universes at pixel boundaries (510 channels /
 | ENTTEC OCTO | 10.0.0.123 | sACN → WS2812B pixel driver |
 | OLA Web UI | http://PiDMX.local:9090 | DMX universe management |
 | ENTTEC Web UI | http://10.0.0.123 | OCTO configuration |
+
+## Git Workflow
+
+The project runs from the git repo at `~/rainshine/` on the Pi. After making changes:
+
+```bash
+cd ~/rainshine
+git add -A
+git commit -m "description of changes"
+git push
+```
+
+If the service file changed, also run the redeploy commands above.
