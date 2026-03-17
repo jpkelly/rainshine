@@ -22,8 +22,10 @@ Requires:
 import argparse
 import array
 import configparser
+import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +36,12 @@ import moderngl
 from ola.ClientWrapper import ClientWrapper
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import BlockingOSCUDPServer
+
+try:
+    import sdnotify
+    _notifier = sdnotify.SystemdNotifier()
+except ImportError:
+    _notifier = None
 
 
 # ── Grid size ────────────────────────────────────────────────────────────────
@@ -154,7 +162,7 @@ def load_config(path):
     if not os.path.exists(path):
         with open(path, "w") as f:
             f.write(DEFAULT_CONFIG)
-        print(f"Created default config: {path}")
+        log.info("Created default config: %s", path)
     cfg.read(path)
     return cfg
 
@@ -165,19 +173,19 @@ def start_osc_server(params, port):
 
     def on_speed(address, value):
         params.update(speed=float(value))
-        print(f"OSC: speed = {value}")
+        log.info("OSC: speed = %s", value)
 
     def on_trail(address, value):
         params.update(trail=int(value))
-        print(f"OSC: trail = {value}")
+        log.info("OSC: trail = %s", value)
 
     def on_density(address, value):
         params.update(density=float(value))
-        print(f"OSC: density = {value}")
+        log.info("OSC: density = %s", value)
 
     def on_fps(address, value):
         params.update(fps=float(value))
-        print(f"OSC: fps = {value}")
+        log.info("OSC: fps = %s", value)
 
     dispatcher.map("/rainshine/speed", on_speed)
     dispatcher.map("/rainshine/trail", on_trail)
@@ -188,6 +196,13 @@ def start_osc_server(params, port):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("rainshine")
 
 
 def main():
@@ -209,7 +224,7 @@ def main():
     osc_port = args.osc_port if args.osc_port is not None else cfg.getint("osc", "port", fallback=7700)
     color_order_name = cfg.get("output", "color_order", fallback="grb").lower()
     color_order = COLOR_ORDERS.get(color_order_name, (1, 0, 2))
-    print(f"Color order: {color_order_name.upper()}")
+    log.info("Color order: %s", color_order_name.upper())
 
     # ── Live params ──────────────────────────────────────────────────────────
     params = Params(speed=speed, trail=trail, density=density, fps=fps)
@@ -228,13 +243,31 @@ def main():
     pixel_map = build_pixel_map(COLS, ROWS)
 
     # ── OLA setup ────────────────────────────────────────────────────────────
-    wrapper = ClientWrapper()
-    client = wrapper.Client()
+    def create_ola_client():
+        w = ClientWrapper()
+        return w, w.Client()
+
+    def ensure_olad():
+        """Restart olad if it's not running."""
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "olad"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            log.warning("olad is not active, restarting it")
+            subprocess.run(["sudo", "systemctl", "restart", "olad"],
+                           capture_output=True, timeout=15)
+            time.sleep(2)  # give olad time to initialize
+
+    wrapper, client = create_ola_client()
 
     # ── OSC server ───────────────────────────────────────────────────────────
     osc_server = start_osc_server(params, osc_port)
-    print(f"OSC listening on port {osc_port}")
+    log.info("OSC listening on port %d", osc_port)
 
+    # Notify systemd we're ready
+    if _notifier:
+        _notifier.notify("READY=1")
     # ── Graceful shutdown ────────────────────────────────────────────────────
     running = True
 
@@ -248,7 +281,11 @@ def main():
     # ── Main render loop ─────────────────────────────────────────────────────
     t0 = time.perf_counter()
     remap_lut = build_remap_lut(pixel_map, color_order, NUM_PIXELS)
-    print(f"Rainshine DMX running — {COLS}x{ROWS} → OLA universe {universe_base}+")
+    log.info("Rainshine DMX running — %dx%d → OLA universe %d+", COLS, ROWS, universe_base)
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 50
+    OLA_HEALTH_INTERVAL = 60  # seconds between OLA health checks
+    last_ola_health_check = time.perf_counter()
 
     while running:
         frame_start = time.perf_counter()
@@ -258,34 +295,74 @@ def main():
         speed, trail, density, fps = params.snapshot()
         frame_dur = 1.0 / fps
 
-        # Update uniforms
-        prog["uTime"].value = t
-        if "uSpeed" in prog:
-            prog["uSpeed"].value = speed
-        if "uTrailLen" in prog:
-            prog["uTrailLen"].value = trail
-        if "uDensity" in prog:
-            prog["uDensity"].value = density
+        try:
+            # Update uniforms
+            prog["uTime"].value = t
+            if "uSpeed" in prog:
+                prog["uSpeed"].value = speed
+            if "uTrailLen" in prog:
+                prog["uTrailLen"].value = trail
+            if "uDensity" in prog:
+                prog["uDensity"].value = density
 
-        fbo.use()
-        vao.render(mode=moderngl.TRIANGLES, vertices=3)
-        ctx.finish()  # ensure GPU is done before readback
+            fbo.use()
+            vao.render(mode=moderngl.TRIANGLES, vertices=3)
+            ctx.finish()  # ensure GPU is done before readback
 
-        # Read back pixels and remap via numpy LUT
-        raw = np.frombuffer(fbo.read(components=3, alignment=1), dtype=np.uint8)
-        dmx_data = raw[remap_lut]
+            # Read back pixels and remap via numpy LUT
+            raw = np.frombuffer(fbo.read(components=3, alignment=1), dtype=np.uint8)
+            dmx_data = raw[remap_lut]
+        except Exception:
+            log.exception("Render/readback failed")
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                log.error("Too many consecutive render errors (%d), exiting", consecutive_errors)
+                break
+            time.sleep(0.1)
+            continue
 
-        # Split across universes on pixel boundaries (510 = 170 pixels × 3)
-        # to avoid splitting a pixel's RGB across two universes
-        CHAN_PER_UNI = 510
-        num_universes = (NUM_CHANNELS + CHAN_PER_UNI - 1) // CHAN_PER_UNI
-        for u in range(num_universes):
-            start = u * CHAN_PER_UNI
-            end = min(start + CHAN_PER_UNI, NUM_CHANNELS)
-            chunk = np.zeros(512, dtype=np.uint8)
-            chunk[:end - start] = dmx_data[start:end]
-            data = array.array("B", chunk.tobytes())
-            client.SendDmx(universe_base + u, data)
+        try:
+            # Split across universes on pixel boundaries (510 = 170 pixels × 3)
+            # to avoid splitting a pixel's RGB across two universes
+            CHAN_PER_UNI = 510
+            num_universes = (NUM_CHANNELS + CHAN_PER_UNI - 1) // CHAN_PER_UNI
+            for u in range(num_universes):
+                start = u * CHAN_PER_UNI
+                end = min(start + CHAN_PER_UNI, NUM_CHANNELS)
+                chunk = np.zeros(512, dtype=np.uint8)
+                chunk[:end - start] = dmx_data[start:end]
+                data = array.array("B", chunk.tobytes())
+                client.SendDmx(universe_base + u, data)
+        except Exception:
+            log.exception("OLA SendDmx failed, reconnecting")
+            try:
+                ensure_olad()
+                wrapper, client = create_ola_client()
+                log.info("OLA reconnected")
+            except Exception:
+                log.exception("OLA reconnect failed")
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                log.error("Too many consecutive errors (%d), exiting", consecutive_errors)
+                break
+            time.sleep(0.5)
+            continue
+
+        consecutive_errors = 0
+
+        # Ping systemd watchdog
+        if _notifier:
+            _notifier.notify("WATCHDOG=1")
+
+        # Periodic OLA health check — reconnect proactively if olad died
+        now = time.perf_counter()
+        if now - last_ola_health_check >= OLA_HEALTH_INTERVAL:
+            last_ola_health_check = now
+            try:
+                ensure_olad()
+                wrapper, client = create_ola_client()
+            except Exception:
+                log.exception("OLA periodic health check failed")
 
         # Optional ASCII preview
         if args.preview:
@@ -321,7 +398,7 @@ def main():
     num_universes = (NUM_CHANNELS + 509) // 510
     for u in range(num_universes):
         client.SendDmx(universe_base + u, black)
-    print("\nBlackout sent. Exiting.")
+    log.info("Blackout sent. Exiting.")
 
 
 if __name__ == "__main__":

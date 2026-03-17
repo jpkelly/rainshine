@@ -4,12 +4,13 @@ After=network.target olad.service
 Wants=olad.service
 
 [Service]
-Type=simple
+Type=notify
 User=pi
 WorkingDirectory=/home/pi
 ExecStart=/home/pi/rainshine-env/bin/python3 /home/pi/rainshine_dmx.py
-Restart=on-failure
+Restart=always
 RestartSec=5
+WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
