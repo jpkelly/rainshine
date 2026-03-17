@@ -451,13 +451,13 @@ def main():
                 line = ""
                 for col in range(COLS):
                     px = (row * COLS + col) * 3
-                    r, g, b = raw[px], raw[px + 1], raw[px + 2]
-                    brightness = (r + g + b) // 3
-                    if brightness > 180:
+                    r, g, b = raw_view[px], raw_view[px + 1], raw_view[px + 2]
+                    avg = (r + g + b) // 3
+                    if avg > 180:
                         line += "#"
-                    elif brightness > 80:
+                    elif avg > 80:
                         line += "+"
-                    elif brightness > 20:
+                    elif avg > 20:
                         line += "."
                     else:
                         line += " "
