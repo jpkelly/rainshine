@@ -282,6 +282,10 @@ def main():
     frame_count = 0
     send_errors = 0
 
+    # Pre-allocate buffers to avoid per-frame allocation
+    raw_buf = bytearray(COLS * ROWS * 3)
+    dmx_buf = np.zeros(NUM_CHANNELS, dtype=np.uint8)
+
     while running:
         frame_start = time.perf_counter()
         t = frame_start - t0
@@ -304,9 +308,10 @@ def main():
             vao.render(mode=moderngl.TRIANGLES, vertices=3)
             ctx.finish()  # ensure GPU is done before readback
 
-            # Read back pixels and remap via numpy LUT
-            raw = np.frombuffer(fbo.read(components=3, alignment=1), dtype=np.uint8)
-            dmx_data = raw[remap_lut]
+            # Read back pixels into pre-allocated buffer and remap via numpy LUT
+            fbo.read_into(raw_buf, components=3, alignment=1)
+            raw = np.frombuffer(raw_buf, dtype=np.uint8)
+            np.take(raw, remap_lut, out=dmx_buf)
         except Exception:
             log.exception("Render/readback failed")
             consecutive_errors += 1
@@ -325,7 +330,7 @@ def main():
                 start = u * CHAN_PER_UNI
                 end = min(start + CHAN_PER_UNI, NUM_CHANNELS)
                 chunk = np.zeros(512, dtype=np.uint8)
-                chunk[:end - start] = dmx_data[start:end]
+                chunk[:end - start] = dmx_buf[start:end]
                 data = array.array("B", chunk.tobytes())
                 client.SendDmx(universe_base + u, data)
         except Exception:
@@ -352,9 +357,18 @@ def main():
         if now - last_status_log >= STATUS_LOG_INTERVAL:
             elapsed = now - last_status_log
             actual_fps = frame_count / elapsed if elapsed > 0 else 0
+            rss_mb = 0
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss_mb = int(line.split()[1]) // 1024
+                            break
+            except OSError:
+                pass
             log.info(
-                "Status: %d frames in %.0fs (%.1f fps), %d send errors, %d consecutive errors",
-                frame_count, elapsed, actual_fps, send_errors, consecutive_errors,
+                "Status: %d frames in %.0fs (%.1f fps), %d send errors, %d consecutive errors, RSS %dMB",
+                frame_count, elapsed, actual_fps, send_errors, consecutive_errors, rss_mb,
             )
             frame_count = 0
             send_errors = 0
