@@ -286,6 +286,10 @@ def main():
     MAX_CONSECUTIVE_ERRORS = 50
     OLA_HEALTH_INTERVAL = 60  # seconds between OLA health checks
     last_ola_health_check = time.perf_counter()
+    STATUS_LOG_INTERVAL = 300  # log status every 5 minutes
+    last_status_log = time.perf_counter()
+    frame_count = 0
+    send_errors = 0
 
     while running:
         frame_start = time.perf_counter()
@@ -335,6 +339,7 @@ def main():
                 client.SendDmx(universe_base + u, data)
         except Exception:
             log.exception("OLA SendDmx failed, reconnecting")
+            send_errors += 1
             try:
                 ensure_olad()
                 wrapper, client = create_ola_client()
@@ -349,18 +354,32 @@ def main():
             continue
 
         consecutive_errors = 0
+        frame_count += 1
 
         # Ping systemd watchdog
         if _notifier:
             _notifier.notify("WATCHDOG=1")
 
-        # Periodic OLA health check — reconnect proactively if olad died
+        # Periodic status log
         now = time.perf_counter()
+        if now - last_status_log >= STATUS_LOG_INTERVAL:
+            elapsed = now - last_status_log
+            actual_fps = frame_count / elapsed if elapsed > 0 else 0
+            log.info(
+                "Status: %d frames in %.0fs (%.1f fps), %d send errors, %d consecutive errors",
+                frame_count, elapsed, actual_fps, send_errors, consecutive_errors,
+            )
+            frame_count = 0
+            send_errors = 0
+            last_status_log = now
+
+        # Periodic OLA health check — reconnect proactively if olad died
         if now - last_ola_health_check >= OLA_HEALTH_INTERVAL:
             last_ola_health_check = now
             try:
                 ensure_olad()
                 wrapper, client = create_ola_client()
+                log.debug("OLA health check OK")
             except Exception:
                 log.exception("OLA periodic health check failed")
 
