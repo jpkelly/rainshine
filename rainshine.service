@@ -1,7 +1,6 @@
 [Unit]
 Description=Rainshine DMX Shader
-After=network.target olad.service
-Wants=olad.service
+After=network.target
 
 [Service]
 Type=simple

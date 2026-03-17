@@ -1,6 +1,6 @@
 # Rainshine — Pi 5 DMX LED Shader
 
-A GLSL rainbow rain shader running headlessly on a Raspberry Pi 5, outputting to WS2812B LEDs via sACN/E1.31 through an ENTTEC Pixel OCTO.
+A GLSL rainbow rain shader running headlessly on a Raspberry Pi 5, outputting to WS2812B LEDs via direct sACN/E1.31 UDP to an ENTTEC Pixel OCTO. No OLA or other DMX middleware required.
 
 ## Hardware
 
@@ -13,7 +13,7 @@ A GLSL rainbow rain shader running headlessly on a Raspberry Pi 5, outputting to
 | File | Description |
 |---|---|
 | `rainshine.frag` | GLSL ES 3.0 fragment shader — rainbow rain effect |
-| `rainshine_dmx.py` | Python host — renders shader headlessly, sends DMX via OLA (sACN) |
+| `rainshine_dmx.py` | Python host — renders shader headlessly, sends DMX via direct sACN/E1.31 UDP |
 | `rainshine.conf` | Config file — default shader params, output settings, OSC port |
 | `rainshine.service` | systemd unit — runs the shader on boot |
 | `setup.sh` | One-time Pi setup script |
@@ -23,7 +23,7 @@ A GLSL rainbow rain shader running headlessly on a Raspberry Pi 5, outputting to
 ### 1. Install dependencies
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv ola libegl1-mesa-dev libgles2-mesa-dev mesa-utils
+sudo apt update && sudo apt install -y python3-pip python3-venv libegl1-mesa-dev libgles2-mesa-dev mesa-utils
 ```
 
 ### 2. Create Python environment
@@ -34,26 +34,7 @@ source ~/rainshine-env/bin/activate
 pip3 install moderngl python-osc numpy
 ```
 
-### 3. Fix OLA Python 3.13 compatibility
-
-```bash
-sudo sed -i 's/\.tostring()/.tobytes()/g' $(python3 -c "import ola.OlaClient; print(ola.OlaClient.__file__)")
-```
-
-### 4. Configure OLA
-
-Start OLA and patch sACN universes:
-
-```bash
-sudo systemctl enable olad
-sudo systemctl start olad
-ola_patch --device 7 --port 0 --universe 1
-ola_patch --device 7 --port 1 --universe 2
-```
-
-Verify: http://PiDMX.local:9090
-
-### 5. Configure ENTTEC Pixel OCTO
+### 3. Configure ENTTEC Pixel OCTO
 
 Via http://10.0.0.123:
 - Input Protocol: **sACN**
@@ -62,14 +43,14 @@ Via http://10.0.0.123:
 - Color Order: **GRB**
 - DMX Start Address: **1**
 
-### 6. Clone the repo
+### 4. Clone the repo
 
 ```bash
 cd ~
 git clone https://github.com/<your-user>/rainshine.git
 ```
 
-### 7. Test
+### 5. Test
 
 ```bash
 source ~/rainshine-env/bin/activate
@@ -77,7 +58,7 @@ cd ~/rainshine
 python3 rainshine_dmx.py --preview
 ```
 
-### 8. Autostart on boot
+### 6. Autostart on boot
 
 ```bash
 sudo cp ~/rainshine/rainshine.service /etc/systemd/system/
@@ -100,6 +81,8 @@ density = 3.0
 fps = 30.0
 universe = 1
 color_order = grb
+brightness = 1.0
+sacn_dest = 10.0.0.123
 
 [osc]
 port = 7700
@@ -121,6 +104,7 @@ Shader parameters can be adjusted in real time via OSC on port **7700**.
 | `/rainshine/trail` | int | 1 – 25 |
 | `/rainshine/density` | float | 0.5 – 5.0 |
 | `/rainshine/fps` | float | 15 – 60 |
+| `/rainshine/brightness` | float | 0.0 – 1.0 |
 
 ### From TouchDesigner
 
@@ -147,6 +131,8 @@ systemctl show rainshine --property=NRestarts    # Restart count since boot
 ```
 
 The service uses `Restart=always` with `RestartSec=5`, so it will automatically recover from crashes.
+
+The script monitors its own RSS memory usage every 5 minutes and exits cleanly if it exceeds 400MB, allowing systemd to restart it fresh.
 
 After editing project files, redeploy with:
 

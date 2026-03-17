@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rainshine_dmx.py — Render rainshine.frag headlessly via moderngl (EGL)
-and output pixel data as DMX through OLA (sACN/E1.31).
+and output pixel data as DMX via sACN/E1.31 (direct UDP).
 Uniforms can be set via config file and adjusted live via OSC.
 
 Usage:
@@ -16,24 +16,24 @@ OSC addresses:
 
 Requires:
     pip3 install moderngl python-osc
-    sudo apt install ola
 """
 
 import argparse
-import array
 import configparser
+import gc
 import logging
 import os
 import signal
-import subprocess
+import socket
+import struct
 import sys
 import threading
 import time
+import uuid
 
 import numpy as np
 
 import moderngl
-from ola.ClientWrapper import ClientWrapper
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import BlockingOSCUDPServer
 
@@ -105,11 +105,12 @@ def build_remap_lut(pixel_map, color_order, num_pixels):
 
 # ── Live parameters (shared between main loop and OSC thread) ────────────────
 class Params:
-    def __init__(self, speed=4.0, trail=10, density=3.0, fps=30.0):
+    def __init__(self, speed=4.0, trail=10, density=3.0, fps=30.0, brightness=1.0):
         self.speed = speed
         self.trail = trail
         self.density = density
         self.fps = fps
+        self.brightness = brightness
         self.lock = threading.Lock()
 
     def update(self, **kwargs):
@@ -120,7 +121,7 @@ class Params:
 
     def snapshot(self):
         with self.lock:
-            return self.speed, self.trail, self.density, self.fps
+            return self.speed, self.trail, self.density, self.fps, self.brightness
 
 
 DEFAULT_CONFIG = """\
@@ -134,6 +135,10 @@ fps = 30.0
 universe = 1
 # Color order to match your LED hardware (rgb, grb, bgr, etc.)
 color_order = grb
+# Overall brightness (0.0 – 1.0)
+brightness = 1.0
+# sACN destination IP (your pixel controller)
+sacn_dest = 10.0.0.123
 
 [osc]
 port = 7700
@@ -148,6 +153,76 @@ COLOR_ORDERS = {
     "gbr": (1, 2, 0),
     "brg": (2, 0, 1),
 }
+
+
+# ── sACN / E1.31 sender (replaces OLA) ──────────────────────────────────────
+class SacnSender:
+    """Minimal E1.31 (sACN) unicast sender with pre-allocated packets."""
+
+    SACN_PORT = 5568
+
+    def __init__(self, destination, source_name="rainshine"):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.dest = (destination, self.SACN_PORT)
+        self._packets = {}
+        self._sequences = {}
+        self._cid = uuid.uuid4().bytes
+        self._source_name = source_name.encode("utf-8")[:63].ljust(64, b"\x00")
+
+    def activate(self, universe):
+        """Pre-build the packet template for a universe."""
+        pkt = bytearray(638)
+
+        # Root Layer
+        struct.pack_into("!HH", pkt, 0, 0x0010, 0x0000)
+        pkt[4:16] = b"ASC-E1.17\x00\x00\x00"
+        struct.pack_into("!H", pkt, 16, 0x7000 | 622)
+        struct.pack_into("!I", pkt, 18, 0x00000004)
+        pkt[22:38] = self._cid
+
+        # Framing Layer
+        struct.pack_into("!H", pkt, 38, 0x7000 | 600)
+        struct.pack_into("!I", pkt, 40, 0x00000002)
+        pkt[44:108] = self._source_name
+        pkt[108] = 100  # Priority
+        struct.pack_into("!H", pkt, 109, 0)  # Sync address
+        pkt[111] = 0  # Sequence (updated per send)
+        pkt[112] = 0  # Options
+        struct.pack_into("!H", pkt, 113, universe)
+
+        # DMP Layer
+        struct.pack_into("!H", pkt, 115, 0x7000 | 523)
+        pkt[117] = 0x02  # Vector
+        pkt[118] = 0xA1  # Address type & data type
+        struct.pack_into("!H", pkt, 119, 0)  # First property address
+        struct.pack_into("!H", pkt, 121, 1)  # Address increment
+        struct.pack_into("!H", pkt, 123, 513)  # Property count (1 start code + 512)
+        pkt[125] = 0x00  # DMX start code
+
+        self._packets[universe] = pkt
+        self._sequences[universe] = 0
+
+    def send(self, universe, data):
+        """Send DMX data (bytes-like or numpy array, up to 512 bytes) to a universe."""
+        pkt = self._packets[universe]
+        seq = self._sequences[universe]
+        pkt[111] = seq
+        self._sequences[universe] = (seq + 1) & 0xFF
+
+        n = min(len(data), 512)
+        pkt[126:126 + n] = data[:n].tobytes()
+        self.sock.sendto(pkt, self.dest)
+
+    def blackout(self, universe):
+        """Send all zeros for a universe."""
+        pkt = self._packets[universe]
+        pkt[111] = self._sequences[universe]
+        self._sequences[universe] = (self._sequences[universe] + 1) & 0xFF
+        pkt[126:638] = b"\x00" * 512
+        self.sock.sendto(pkt, self.dest)
+
+    def close(self):
+        self.sock.close()
 
 
 def load_config(path):
@@ -181,10 +256,15 @@ def start_osc_server(params, port):
         params.update(fps=float(value))
         log.info("OSC: fps = %s", value)
 
+    def on_brightness(address, value):
+        params.update(brightness=max(0.0, min(1.0, float(value))))
+        log.info("OSC: brightness = %s", value)
+
     dispatcher.map("/rainshine/speed", on_speed)
     dispatcher.map("/rainshine/trail", on_trail)
     dispatcher.map("/rainshine/density", on_density)
     dispatcher.map("/rainshine/fps", on_fps)
+    dispatcher.map("/rainshine/brightness", on_brightness)
 
     server = BlockingOSCUDPServer(("0.0.0.0", port), dispatcher)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -200,9 +280,9 @@ log = logging.getLogger("rainshine")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rainshine shader → DMX via OLA")
+    parser = argparse.ArgumentParser(description="Rainshine shader → DMX via sACN")
     parser.add_argument("--config", type=str, default="rainshine.conf", help="Config file path")
-    parser.add_argument("--universe", type=int, default=None, help="Override OLA universe from config")
+    parser.add_argument("--universe", type=int, default=None, help="Override sACN universe from config")
     parser.add_argument("--osc-port", type=int, default=None, help="Override OSC port from config")
     parser.add_argument("--shader", type=str, default="rainshine.frag", help="Fragment shader path")
     parser.add_argument("--preview", action="store_true", help="Print ASCII preview to terminal")
@@ -214,14 +294,16 @@ def main():
     trail = cfg.getint("shader", "trail", fallback=10)
     density = cfg.getfloat("shader", "density", fallback=3.0)
     fps = cfg.getfloat("output", "fps", fallback=30.0)
+    brightness = max(0.0, min(1.0, cfg.getfloat("output", "brightness", fallback=1.0)))
     universe_base = args.universe if args.universe is not None else cfg.getint("output", "universe", fallback=1)
     osc_port = args.osc_port if args.osc_port is not None else cfg.getint("osc", "port", fallback=7700)
     color_order_name = cfg.get("output", "color_order", fallback="grb").lower()
     color_order = COLOR_ORDERS.get(color_order_name, (1, 0, 2))
+    sacn_dest = cfg.get("output", "sacn_dest", fallback="10.0.0.123")
     log.info("Color order: %s", color_order_name.upper())
 
     # ── Live params ──────────────────────────────────────────────────────────
-    params = Params(speed=speed, trail=trail, density=density, fps=fps)
+    params = Params(speed=speed, trail=trail, density=density, fps=fps, brightness=brightness)
 
     # ── GL context (headless EGL, OpenGL ES 3.1) ────────────────────────────
     ctx = moderngl.create_standalone_context(backend="egl", libgl="libGLESv2.so", require=310)
@@ -236,24 +318,13 @@ def main():
     # ── Pixel → DMX mapping ──────────────────────────────────────────────────
     pixel_map = build_pixel_map(COLS, ROWS)
 
-    # ── OLA setup ────────────────────────────────────────────────────────────
-    def create_ola_client():
-        w = ClientWrapper()
-        return w, w.Client()
-
-    def ensure_olad():
-        """Restart olad if it's not running."""
-        result = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "olad"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            log.warning("olad is not active, restarting it")
-            subprocess.run(["sudo", "systemctl", "restart", "olad"],
-                           capture_output=True, timeout=15)
-            time.sleep(2)  # give olad time to initialize
-
-    wrapper, client = create_ola_client()
+    # ── sACN sender (direct E1.31 over UDP) ──────────────────────────────────
+    CHAN_PER_UNI = 510
+    num_universes = (NUM_CHANNELS + CHAN_PER_UNI - 1) // CHAN_PER_UNI
+    sender = SacnSender(sacn_dest)
+    for u in range(num_universes):
+        sender.activate(universe_base + u)
+    log.info("sACN sender → %s (universes %d–%d)", sacn_dest, universe_base, universe_base + num_universes - 1)
 
     # ── OSC server ───────────────────────────────────────────────────────────
     osc_server = start_osc_server(params, osc_port)
@@ -272,26 +343,27 @@ def main():
     # ── Main render loop ─────────────────────────────────────────────────────
     t0 = time.perf_counter()
     remap_lut = build_remap_lut(pixel_map, color_order, NUM_PIXELS)
-    log.info("Rainshine DMX running — %dx%d → OLA universe %d+", COLS, ROWS, universe_base)
+    log.info("Rainshine DMX running — %dx%d → sACN universe %d+", COLS, ROWS, universe_base)
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 50
-    OLA_HEALTH_INTERVAL = 60  # seconds between OLA health checks
-    last_ola_health_check = time.perf_counter()
+    RSS_MAX_MB = 400  # exit cleanly if RSS exceeds this (systemd restarts us)
     STATUS_LOG_INTERVAL = 300  # log status every 5 minutes
     last_status_log = time.perf_counter()
     frame_count = 0
     send_errors = 0
 
-    # Pre-allocate buffers to avoid per-frame allocation
+    # Pre-allocate ALL buffers to avoid per-frame allocation
     raw_buf = bytearray(COLS * ROWS * 3)
+    raw_view = np.frombuffer(raw_buf, dtype=np.uint8)
     dmx_buf = np.zeros(NUM_CHANNELS, dtype=np.uint8)
+    dmx_scaled = np.zeros(NUM_CHANNELS, dtype=np.uint8)
 
     while running:
         frame_start = time.perf_counter()
         t = frame_start - t0
 
         # Read live params
-        speed, trail, density, fps = params.snapshot()
+        speed, trail, density, fps, brightness = params.snapshot()
         frame_dur = 1.0 / fps
 
         try:
@@ -306,12 +378,16 @@ def main():
 
             fbo.use()
             vao.render(mode=moderngl.TRIANGLES, vertices=3)
-            ctx.finish()  # ensure GPU is done before readback
 
-            # Read back pixels into pre-allocated buffer and remap via numpy LUT
+            # read_into implicitly waits for GPU completion
             fbo.read_into(raw_buf, components=3, alignment=1)
-            raw = np.frombuffer(raw_buf, dtype=np.uint8)
-            np.take(raw, remap_lut, out=dmx_buf)
+            np.take(raw_view, remap_lut, out=dmx_buf)
+
+            # Apply brightness scaling
+            if brightness < 1.0:
+                np.multiply(dmx_buf, brightness, out=dmx_scaled, casting="unsafe")
+            else:
+                np.copyto(dmx_scaled, dmx_buf)
         except Exception:
             log.exception("Render/readback failed")
             consecutive_errors += 1
@@ -323,30 +399,18 @@ def main():
 
         try:
             # Split across universes on pixel boundaries (510 = 170 pixels × 3)
-            # to avoid splitting a pixel's RGB across two universes
-            CHAN_PER_UNI = 510
-            num_universes = (NUM_CHANNELS + CHAN_PER_UNI - 1) // CHAN_PER_UNI
             for u in range(num_universes):
                 start = u * CHAN_PER_UNI
                 end = min(start + CHAN_PER_UNI, NUM_CHANNELS)
-                chunk = np.zeros(512, dtype=np.uint8)
-                chunk[:end - start] = dmx_buf[start:end]
-                data = array.array("B", chunk.tobytes())
-                client.SendDmx(universe_base + u, data)
+                sender.send(universe_base + u, dmx_scaled[start:end])
         except Exception:
-            log.exception("OLA SendDmx failed, reconnecting")
+            log.exception("sACN send failed")
             send_errors += 1
-            try:
-                ensure_olad()
-                wrapper, client = create_ola_client()
-                log.info("OLA reconnected")
-            except Exception:
-                log.exception("OLA reconnect failed")
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log.error("Too many consecutive errors (%d), exiting", consecutive_errors)
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)
             continue
 
         consecutive_errors = 0
@@ -370,25 +434,15 @@ def main():
                 "Status: %d frames in %.0fs (%.1f fps), %d send errors, %d consecutive errors, RSS %dMB",
                 frame_count, elapsed, actual_fps, send_errors, consecutive_errors, rss_mb,
             )
+            gc.collect()
             frame_count = 0
             send_errors = 0
             last_status_log = now
 
-        # Periodic OLA health check — only reconnect if olad was down
-        if now - last_ola_health_check >= OLA_HEALTH_INTERVAL:
-            last_ola_health_check = now
-            try:
-                result = subprocess.run(
-                    ["systemctl", "is-active", "--quiet", "olad"],
-                    capture_output=True,
-                )
-                if result.returncode != 0:
-                    log.warning("olad is not active, restarting and reconnecting")
-                    ensure_olad()
-                    wrapper, client = create_ola_client()
-                    log.info("OLA reconnected after health check")
-            except Exception:
-                log.exception("OLA periodic health check failed")
+            # Self-check: exit if RSS exceeds threshold (systemd restarts us)
+            if rss_mb > RSS_MAX_MB:
+                log.warning("RSS %dMB exceeds limit %dMB, exiting for clean restart", rss_mb, RSS_MAX_MB)
+                break
 
         # Optional ASCII preview
         if args.preview:
@@ -420,10 +474,9 @@ def main():
             pass
 
     # Blackout on exit
-    black = array.array("B", [0] * 512)
-    num_universes = (NUM_CHANNELS + 509) // 510
     for u in range(num_universes):
-        client.SendDmx(universe_base + u, black)
+        sender.blackout(universe_base + u)
+    sender.close()
     log.info("Blackout sent. Exiting.")
 
 
