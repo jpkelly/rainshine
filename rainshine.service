@@ -6,8 +6,8 @@ Wants=olad.service
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi
-ExecStart=/home/pi/rainshine-env/bin/python3 /home/pi/rainshine_dmx.py
+WorkingDirectory=/home/pi/rainshine
+ExecStart=/home/pi/rainshine-env/bin/python3 /home/pi/rainshine/rainshine_dmx.py
 Restart=always
 RestartSec=5
 
