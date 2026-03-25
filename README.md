@@ -1,3 +1,10 @@
+> [!WARNING]
+> **This repository is archived and no longer maintained.**
+> Development has moved to [jpkelly/PiDMX](https://github.com/jpkelly/PiDMX), which contains all the same files plus improved documentation, a proper `.gitignore`, and ongoing feature development (motion sensor integration, etc.).
+> Please use [jpkelly/PiDMX](https://github.com/jpkelly/PiDMX) going forward.
+
+---
+
 # Rainshine — Pi 5 DMX LED Shader
 
 GLSL rainbow rain shader rendered headlessly on a Raspberry Pi 5, driving WS2812B LEDs via sACN/E1.31 unicast UDP through an ENTTEC Pixel OCTO.
